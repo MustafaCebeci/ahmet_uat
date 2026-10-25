@@ -5,6 +5,30 @@ const jwt = require("jsonwebtoken");
 const { sendOtp, verifyOtp, sendCancellationSms } = require("./notification.service.js");
 const { sendNotification } = require("./messageManager");
 const { emitAppointment, emitDesktopEvent } = require("./sse");
+const { getBookingFlowMode, invalidateBookingFlowModeCache, BOOKING_FLOW_MODES } = require("./settingsManager");
+
+// "Beni hatırla" oturum süresi (gün)
+const REMEMBER_DAYS = 90;
+const REMEMBER_MAX_AGE_MS = REMEMBER_DAYS * 24 * 60 * 60 * 1000;
+
+// OTP gönderim sınırları (kullanıcı başına DB, IP başına bellek)
+const OTP_WINDOW_MINUTES = 10;
+const OTP_MAX_PER_USER = 5;
+const OTP_MAX_PER_IP = 10;
+const otpIpHits = new Map(); // ip -> number[] (ms timestamps)
+
+function otpIpAllowed(ip) {
+    const now = Date.now();
+    const windowMs = OTP_WINDOW_MINUTES * 60 * 1000;
+    const hits = (otpIpHits.get(ip) || []).filter((ts) => now - ts < windowMs);
+    if (hits.length >= OTP_MAX_PER_IP) {
+        otpIpHits.set(ip, hits);
+        return false;
+    }
+    hits.push(now);
+    otpIpHits.set(ip, hits);
+    return true;
+}
 
 // --------------- Helpers ---------------
 function httpError(status, message) {
@@ -225,6 +249,24 @@ async function createConfirmedAppointmentWithSlots({
     return appointmentId;
 }
 
+// OTP gönderiminden önce çağrılır: IP ve kullanıcı başına sınır, aşılırsa 429.
+// otp_codes.created_at doldurulmadığı için expires_at (= oluşturma + ttl) üzerinden sayılır.
+async function assertOtpAllowed(req, userType, userId) {
+    const ip = req.ip || req.socket?.remoteAddress || "unknown";
+    if (!otpIpAllowed(ip)) {
+        throw httpError(429, "Cok fazla deneme. Lutfen daha sonra tekrar deneyin.");
+    }
+    const since = t.toISODateTime(t.now().subtract({ minutes: OTP_WINDOW_MINUTES }));
+    const [rows] = await pool.execute(
+        `SELECT COUNT(*) AS cnt FROM otp_codes
+         WHERE user_type = ? AND user_id = ? AND expires_at > ?`,
+        [userType, userId, since]
+    );
+    if (Number(rows[0]?.cnt ?? 0) >= OTP_MAX_PER_USER) {
+        throw httpError(429, "Cok fazla kod istendi. Lutfen birkac dakika sonra tekrar deneyin.");
+    }
+}
+
 // --------------- JWT helpers ---------------
 function mustJwtSecret() {
     const s = process.env.JWT_SECRET;
@@ -286,16 +328,46 @@ const AuthControllers = {
             );
 
             const customer = rows[0];
-            const customerId = customer?.id;
+            let customerId = customer?.id;
             if (!customerId) {
-                const redirectUrl = `/register?phone=${encodeURIComponent(phone)}`;
-                return res.status(404).json({
-                    ok: false,
-                    message: "Customer not found",
-                    redirect_url: redirectUrl,
-                });
-            }
-            if (Number(customer.is_active) === 0) {
+                // Hizli akis: sadece booking_flow_mode='quick' iken telefon otomatik kaydedilir
+                const canAutoRegister =
+                    body.autoRegister === true && /^5\d{9}$/.test(phone) &&
+                    (await getBookingFlowMode()) === "quick";
+                if (!canAutoRegister) {
+                    const redirectUrl = `/register?phone=${encodeURIComponent(phone)}`;
+                    return res.status(404).json({
+                        ok: false,
+                        message: "Customer not found",
+                        redirect_url: redirectUrl,
+                    });
+                }
+                // Yeni satir olusmadan once IP sinirini uygula (spam kayit engeli)
+                const ip = req.ip || req.socket?.remoteAddress || "unknown";
+                if (!otpIpAllowed(ip)) {
+                    throw httpError(429, "Cok fazla deneme. Lutfen daha sonra tekrar deneyin.");
+                }
+                try {
+                    customerId = await Models.customers.create({
+                        phone,
+                        display_name: null,
+                        nickname: null,
+                        is_active: 1,
+                    });
+                } catch (err) {
+                    // Es zamanli istekte baska bir istek olusturmus olabilir
+                    if (err && (err.code === "ER_DUP_ENTRY" || err.errno === 1062)) {
+                        const [again] = await pool.execute(
+                            `SELECT id FROM customers WHERE phone = ? LIMIT 1`,
+                            [phone]
+                        );
+                        customerId = again[0]?.id;
+                    } else {
+                        throw err;
+                    }
+                }
+                if (!customerId) throw httpError(500, "Musteri olusturulamadi");
+            } else if (Number(customer.is_active) === 0) {
                 throw httpError(403, "Hesap pasif");
             }
             const [flagRows] = await pool.execute(
@@ -308,6 +380,26 @@ const AuthControllers = {
                     message: "Hesabiniz kara listeye alinmistir.",
                 });
             }
+
+            // Hizli akis: limit dolmussa OTP gondermeden uyar (yeni olusturulan musteride 0 randevu vardir)
+            if (body.autoRegister === true && (await getBookingFlowMode()) === "quick") {
+                const settingsJson = await getBusinessSettingsJson();
+                const maxActiveCount = Number(settingsJson.multiple_appointment_count ?? 2);
+                if (Number.isFinite(maxActiveCount) && maxActiveCount > 0) {
+                    const [cntRows] = await pool.execute(
+                        `SELECT COUNT(*) AS cnt FROM appointments WHERE customer_id = ? AND status = 'confirmed'`,
+                        [customerId]
+                    );
+                    if (Number(cntRows[0]?.cnt ?? 0) >= maxActiveCount) {
+                        throw httpError(
+                            400,
+                            "Randevu limitine ulaşılmıştır. Lütfen başka bir numara girin."
+                        );
+                    }
+                }
+            }
+
+            await assertOtpAllowed(req, "customer", customerId);
 
             const resp = await sendOtp({
                 user_type: "customer",
@@ -353,6 +445,7 @@ const AuthControllers = {
             console.log('[DEBUG LOGIN] Account found:', acc.id, '| is_active:', acc.is_active);
             if (acc.is_active === 0) throw httpError(403, "Hesap pasif");
 
+            await assertOtpAllowed(req, "staff_account", acc.id);
             console.log('[DEBUG LOGIN] Calling sendOtp for staff_account:', acc.id, '| phone:', acc.staff_phone);
             const resp = await sendOtp({
                 user_type: "staff_account",
@@ -496,7 +589,10 @@ const AuthControllers = {
         }
 
         const isUser = userType === "user" || userType === "barber";
-        const token = signJwt(payload, { expiresIn: isUser ? "2d" : undefined });
+        const remember = body.remember === true;
+        const token = signJwt(payload, {
+            expiresIn: remember ? `${REMEMBER_DAYS}d` : isUser ? "2d" : undefined,
+        });
 
         console.log('[DEBUG VERIFY] Token oluşturuldu, cookie set ediliyor...');
         console.log('[DEBUG VERIFY] isUser:', isUser, '| maxAge:', isUser ? 2 * 24 * 60 * 60 * 1000 : 'default');
@@ -504,7 +600,9 @@ const AuthControllers = {
         res.cookie(
             "access_token",
             token,
-            cookieOptions({ maxAge: isUser ? 2 * 24 * 60 * 60 * 1000 : undefined })
+            cookieOptions({
+                maxAge: remember ? REMEMBER_MAX_AGE_MS : isUser ? 2 * 24 * 60 * 60 * 1000 : undefined,
+            })
         );
 
         console.log('[DEBUG VERIFY] Cookie set edildi, response dönüyor...');
@@ -584,6 +682,10 @@ const AuthControllers = {
 
             if (!rows.length) {
                 return res.status(404).json({ ok: false, message: "User not found" });
+            }
+            // 90 gunluk oturumlarda pasife alinan hesap hemen dussun
+            if (Number(rows[0].is_active) === 0) {
+                return res.status(403).json({ ok: false, message: "Hesap pasif" });
             }
 
             const businessName = settingsJson.business_name ?? settingsJson.businessName ?? null;
@@ -3782,8 +3884,7 @@ VALUES
      * V2 Slot Generator - Uses generateSlotsV2Engine for pure algorithm
      */
     generateSlotsV2: asyncWrap(async (req, res) => {
-        const decoded = readJwtFromReq(req);
-        if (!decoded) throw httpError(401, "Unauthenticated");
+        // Public: hizli akis (oturumsuz) musaitlik gorebilmeli. Yanitta musteri verisi yok.
 
         // Import engine at runtime to avoid circular deps
         const { generateSlotsV2Engine } = require("./src/services/slot-generator-v2");
@@ -4827,12 +4928,21 @@ const ScopedControllers = {
             }
         }
 
+        if (
+            settingsObj?.booking_flow_mode !== undefined &&
+            !BOOKING_FLOW_MODES.includes(settingsObj.booking_flow_mode)
+        ) {
+            throw httpError(400, "booking_flow_mode 'detailed' veya 'quick' olmali");
+        }
+
         await pool.execute(
             `INSERT INTO app_settings (id, settings_json)
              VALUES (1, ?)
              ON DUPLICATE KEY UPDATE settings_json = VALUES(settings_json), updated_at = ?`,
             [JSON.stringify(settingsObj || {}), t.toISODateTime(t.now())]
         );
+
+        invalidateBookingFlowModeCache();
 
         // Desktop SSE — settings değiştiyse bildir
         emitDesktopEvent("state", "settings.updated", {
@@ -5626,8 +5736,7 @@ const ScopedControllers = {
     }),
 
     periodSettingsForDate: asyncWrap(async (req, res) => {
-        const decoded = requireUser(req);
-        if (!decoded) throw httpError(401, "Unauthenticated");
+        // Public read: musteri formu donem fiyatlarini oturumsuz da gostermeli
         const body = req.body || {};
         const dateStr = String(body.date || "").trim();
         if (!dateStr) throw httpError(400, "date zorunlu (YYYY-MM-DD)");

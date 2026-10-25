@@ -142,6 +142,7 @@ async function seed() {
                     booking_coming_day_range: 2,
                     multiple_appointment_count: 8,
                     scheduler_interval_minutes: 15,
+                    booking_flow_mode: "detailed",
                 }),
             });
             console.log("   ✓ App settings created");

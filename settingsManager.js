@@ -25,8 +25,33 @@ const DEFAULT_SETTINGS = {
   printer_auto_print_new: false,
   printer_daily_report: false,
   print_iban: false,
-  communication_channel: 'sms'
+  communication_channel: 'sms',
+  booking_flow_mode: 'detailed'
 };
+
+const BOOKING_FLOW_MODES = ['detailed', 'quick'];
+
+// Gate (app.js) her istekte DB'ye gitmesin diye kısa süreli cache
+let flowModeCache = { value: 'detailed', at: 0 };
+const FLOW_MODE_TTL_MS = 30 * 1000;
+
+async function getBookingFlowMode() {
+  if (Date.now() - flowModeCache.at < FLOW_MODE_TTL_MS) return flowModeCache.value;
+  try {
+    const mode = await getSetting('booking_flow_mode');
+    flowModeCache = {
+      value: BOOKING_FLOW_MODES.includes(mode) ? mode : 'detailed',
+      at: Date.now()
+    };
+  } catch {
+    flowModeCache = { value: 'detailed', at: Date.now() };
+  }
+  return flowModeCache.value;
+}
+
+function invalidateBookingFlowModeCache() {
+  flowModeCache.at = 0;
+}
 
 /**
  * app_settings tablosundaki settings_json'u okur.
@@ -113,6 +138,9 @@ async function updateSettings(partial) {
 
 module.exports = {
   DEFAULT_SETTINGS,
+  BOOKING_FLOW_MODES,
+  getBookingFlowMode,
+  invalidateBookingFlowModeCache,
   ensureSettingsDefaults,
   getSettings,
   getSetting,

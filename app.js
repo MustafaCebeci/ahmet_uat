@@ -13,7 +13,7 @@ const { pathToRegexp } = require("path-to-regexp");
 const { pool } = require("./models");
 const t = require("./temporal_api.utils");
 const { startScheduler } = require("./cron");
-const { ensureSettingsDefaults } = require("./settingsManager");
+const { ensureSettingsDefaults, getBookingFlowMode } = require("./settingsManager");
 const { logRequest } = require("./logger.js");
 
 const app = express();
@@ -92,6 +92,11 @@ const publicApi = [
   "/api/branches/current",
   "/api/services",
   "/api/staff",
+  // Hizli randevu akisi (oturumsuz form): saglayici/hizmet/musaitlik/donem fiyati okuma
+  "/api/service_providers",
+  "/api/provider_services/by-provider",
+  "/api/appointments/slots/generate/v2",
+  "/api/period_settings/for-date",
   "/api/branch_closures/today",
   "/api/cron/jobs",
   "/api/desktop/events/stream",
@@ -127,9 +132,14 @@ function loginRedirectForPath(pathname) {
   return "/login_customer";
 }
 
-app.use((req, res, next) => {
+app.use(async (req, res, next) => {
   if (!isProduction) return next();
   const pathname = req.path || "/";
+
+  // Hizli akis aciksa /randevu sayfasi oturumsuz acilir (OTP formun sonunda istenir)
+  if (pathname.replace(/\/+$/, "") === "/randevu" && (await getBookingFlowMode()) === "quick") {
+    return next();
+  }
 
   if (isPublicAsset(pathname)) return next();
 
